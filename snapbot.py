@@ -39,6 +39,12 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     sys.exit("❌  Set TELEGRAM_BOT_TOKEN in your .env file.")
 
+TELEGRAM_PROXY_URL = (os.getenv("TELEGRAM_PROXY_URL") or "").strip()
+TELEGRAM_CONNECT_TIMEOUT = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "20"))
+TELEGRAM_READ_TIMEOUT = float(os.getenv("TELEGRAM_READ_TIMEOUT", "30"))
+TELEGRAM_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "30"))
+TELEGRAM_POOL_TIMEOUT = float(os.getenv("TELEGRAM_POOL_TIMEOUT", "30"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-8s │ %(message)s",
@@ -46,6 +52,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 Path("snapchat_downloads").mkdir(exist_ok=True)
+
+
+def _apply_ptb_updater_slots_compat() -> None:
+    """
+    Compatibility shim for python-telegram-bot versions where Updater.__slots__
+    is missing _Updater__polling_cleanup_cb but __init__ still assigns it.
+    """
+    try:
+        import telegram.ext._applicationbuilder as _ptb_appbuilder
+        import telegram.ext._updater as _ptb_updater
+    except Exception:
+        return
+
+    missing_slot = "_Updater__polling_cleanup_cb"
+    slots = getattr(_ptb_updater.Updater, "__slots__", ())
+    if missing_slot in slots:
+        return
+
+    class _PatchedUpdater(_ptb_updater.Updater):
+        __slots__ = tuple(slots) + (missing_slot,)
+
+    _ptb_updater.Updater = _PatchedUpdater
+    _ptb_appbuilder.Updater = _PatchedUpdater
+    logger.warning(
+        "Applied Updater compatibility shim for python-telegram-bot __slots__ bug."
+    )
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -71,6 +103,7 @@ class SnapContent:
     timestamp:    int
     views:        int  = 0
     is_spotlight: bool = False
+    alt_urls:     tuple = ()   # extra rendition URLs (higher quality candidates)
 
 @dataclass
 class UserTrack:
@@ -325,6 +358,62 @@ class SnapchatDownloader:
 
         return ""
 
+    # ── ALL rendition URLs in quality-priority order ────────────────────────
+    @staticmethod
+    def _extract_url_candidates(snap: Dict, spotlight: bool) -> List[str]:
+        """
+        Every valid http URL found on the snap, best-quality first
+        (same priority rules as _extract_url, then the remaining fields).
+        """
+        keys = (("mediaUrl2", "mediaUrl", "overlayUrl", "url") if spotlight
+                else ("mediaUrl", "mediaUrl2", "overlayUrl", "url"))
+        snap_urls = snap.get("snapUrls", {})
+        out: List[str] = []
+
+        def _add(v):
+            if (isinstance(v, str) and v.startswith("http")
+                    and v not in out and not any(
+                        m in v.lower() for m in ("thumb", "preview", "=low"))):
+                out.append(v)
+
+        if isinstance(snap_urls, dict):
+            for k in keys:                       _add(snap_urls.get(k, ""))
+            for k in snap_urls:                  # anything else that looks real
+                if isinstance(k, str) and k not in keys:
+                    _add(snap_urls.get(k, ""))
+        elif isinstance(snap_urls, str):
+            _add(snap_urls)
+
+        for key in ("mediaUrl2", "mediaUrl", "url", "videoUrl", "imageUrl",
+                    "overlayUrl", "cdnUrl", "downloadUrl"):
+            _add(snap.get(key, ""))
+
+        for media_key in ("media", "snapMedia", "content"):
+            m = snap.get(media_key, {})
+            if isinstance(m, dict):
+                for key in ("mediaUrl2", "mediaUrl", "url", "src"):
+                    _add(m.get(key, ""))
+        return out
+
+    # ── Higher-quality URL variants for one URL ─────────────────────────────
+    @staticmethod
+    def _quality_variants(url: str) -> List[str]:
+        """
+        Derive possible higher-bitrate renditions from CDN quality markers.
+        Only used when they actually return MORE bytes than the original.
+        """
+        swaps = (
+            ("/low/",  "/high/"),  ("_low.",  "_high."),  ("-low.", "-high."),
+            ("low_",   "high_"),   ("=low",   "=high"),
+        )
+        out: List[str] = []
+        for a, b in swaps:
+            if a in url:
+                v = url.replace(a, b)
+                if v not in out:
+                    out.append(v)
+        return out
+
     # ── Timestamp extraction — tries every known field ──────────────────────
     @staticmethod
     def _extract_timestamp(snap: Dict) -> int:
@@ -384,7 +473,11 @@ class SnapchatDownloader:
     # ── Snap extractor ──────────────────────────────────────────────────────
     @staticmethod
     def _extract_snap(snap: Dict, username: str, spotlight: bool) -> Optional["SnapContent"]:
-        url = SnapchatDownloader._extract_url(snap, spotlight=spotlight)
+        cands = SnapchatDownloader._extract_url_candidates(snap, spotlight)
+        url = cands[0] if cands else ""
+        if not url:
+            # legacy fallback in case candidates found nothing
+            url = SnapchatDownloader._extract_url(snap, spotlight=spotlight)
         if not url:
             return None
 
@@ -401,6 +494,7 @@ class SnapchatDownloader:
             timestamp=ts,
             views=int(snap.get("viewCount", snap.get("views", 0)) or 0),
             is_spotlight=spotlight,
+            alt_urls=tuple(cands[1:]) if len(cands) > 1 else (),
         )
 
     # ── Story parser ────────────────────────────────────────────────────────
@@ -516,54 +610,98 @@ class SnapchatDownloader:
             "Origin": "https://www.snapchat.com",
         }
 
-        for attempt in range(1, DOWNLOAD_RETRY + 1):
+        # ── HIGH-QUALITY candidate ladder ────────────────────────────────
+        # 1) primary URL (already the clean/highest-priority rendition)
+        # 2) alternate rendition URLs stored on the item (in priority order)
+        #    → first success wins, so watermark-free preference is preserved
+        # 3) derived quality-marker variants ("/low/"→"/high/" etc.)
+        #    → accepted ONLY if they return MORE bytes than current best
+        alts = list(getattr(content, "alt_urls", ()) or ())
+        urls: List[str] = [content.media_url]
+        for u in alts:
+            if u and u not in urls:
+                urls.append(u)
+        upgrades: List[str] = []
+        for u in list(urls):
+            for v in self._quality_variants(u):
+                if v not in urls and v not in upgrades:
+                    upgrades.append(v)
+
+        def _fetch_one(u: str) -> Optional[Tuple[bytes, str]]:
+            for attempt in range(1, DOWNLOAD_RETRY + 1):
+                try:
+                    # stream=False: load the entire file into memory at once.
+                    r = requests.get(
+                        u,
+                        headers=dl_headers,
+                        timeout=60,       # generous timeout for large videos
+                        stream=False,
+                        allow_redirects=True,
+                    )
+                    r.raise_for_status()
+                    data = r.content
+                    if not data or len(data) < 16:
+                        raise ValueError(
+                            f"Response too small: {len(data) if data else 0} bytes")
+                    ct = r.headers.get("Content-Type", "")
+                    return data, ct
+                except Exception as e:
+                    logger.warning(
+                        f"Download attempt {attempt}/{DOWNLOAD_RETRY} failed: {e}")
+                    if attempt < DOWNLOAD_RETRY:
+                        time.sleep(2 * attempt)
+            return None
+
+        best_data: Optional[bytes] = None
+        best_ct: str = ""
+        best_url: str = ""
+
+        # Phase 1 — priority URLs, first success wins
+        for u in urls:
+            got = _fetch_one(u)
+            if got is not None:
+                best_data, best_ct, best_url = got[0], got[1], u
+                break
+
+        if best_data is None:
+            logger.error(f"All {DOWNLOAD_RETRY} attempts failed: "
+                         f"{content.media_url[:80]}")
+            return None
+
+        # Phase 2 — optional higher-bitrate upgrades (strictly larger only)
+        for v in upgrades:
             try:
-                # stream=False: load the entire file into memory at once.
-                # This is identical to how images are downloaded and works
-                # reliably for both small images and large video files.
-                r = requests.get(
-                    content.media_url,
-                    headers=dl_headers,
-                    timeout=60,       # generous timeout for large video files
-                    stream=False,     # same as image download — load all at once
-                    allow_redirects=True,
-                )
-                r.raise_for_status()
+                r = requests.get(v, headers=dl_headers, timeout=60,
+                                 stream=False, allow_redirects=True)
+                if r.status_code == 200 and r.content and len(r.content) > len(best_data):
+                    logger.info(f"Quality upgrade: {len(best_data):,} → "
+                                f"{len(r.content):,} bytes")
+                    best_data = r.content
+                    best_ct = r.headers.get("Content-Type", "")
+                    best_url = v
+            except Exception:
+                continue   # upgrade is optional — keep what we have
 
-                data = r.content
-                if not data or len(data) < 16:
-                    raise ValueError(f"Response too small: {len(data) if data else 0} bytes")
-
-                # Detect extension from real bytes — same logic for image & video
-                ext = _detect_extension(
-                    data,
-                    r.headers.get("Content-Type", ""),
-                    content.media_url,
-                )
-                logger.debug(
-                    f"Downloaded {len(data):,} bytes  ext={ext}  "
-                    f"ct={r.headers.get('Content-Type', '?')}"
-                )
-                return data, ext
-
-            except Exception as e:
-                logger.warning(f"Download attempt {attempt}/{DOWNLOAD_RETRY} failed: {e}")
-                if attempt < DOWNLOAD_RETRY:
-                    time.sleep(2 * attempt)
-
-        logger.error(f"All {DOWNLOAD_RETRY} attempts failed: {content.media_url[:80]}")
-        return None
+        ext = _detect_extension(best_data, best_ct, best_url)
+        logger.debug(
+            f"Downloaded {len(best_data):,} bytes  ext={ext}  url={best_url[:80]}"
+        )
+        return best_data, ext
 
 # ─────────────────────────────────────────────────────────────
 # UTILITIES
 # ─────────────────────────────────────────────────────────────
 def make_filename(c: SnapContent, ext: str = "") -> str:
-    """ext should come from _detect_extension() on real bytes, not JSON media_type."""
-    dt   = datetime.fromtimestamp(c.timestamp)
+    """ext should come from _detect_extension() on real bytes, not JSON media_type.
+
+    Format: username_date  →  e.g. john_2026-08-23.mp4
+    Kept short so 'Save to Gallery' / 3-dot download shows a clean
+    username_date name on web + Android + iOS (Files).
+    """
+    dt = datetime.fromtimestamp(c.timestamp)
     if not ext:
         ext = "jpg" if c.media_type == 0 else "mp4"
-    kind = "spotlight" if c.is_spotlight else "story"
-    return f"{c.username}_{kind}_{dt.strftime('%Y-%m-%d_%H-%M-%S')}.{ext}"
+    return f"{c.username}_{dt.strftime('%Y-%m-%d')}.{ext}"
 
 def human_age(ts: int) -> str:
     d = int(time.time() - ts)
@@ -625,40 +763,60 @@ async def send_media_file(
 ) -> bool:
     """
     Send media using the correct Telegram method:
-      • Videos (mp4/webm/…) → reply_video  — native playback, gallery saves correctly
-      • Images              → reply_photo  — native display
+      • Videos (mp4/webm/…) → reply_document — keeps filename everywhere
+      • Images              → reply_document — raw file, preserves filename
       • Unknown / other     → reply_document — raw file, always preserves filename
 
-    Using reply_video for mp4 is critical: Telegram natively embeds the filename
-    in the video message so that "Save to Gallery" on both Android and iOS stores
-    the file with the correct name and format.
+    IMPORTANT: the Telegram Bot API strips the filename from video messages
+    (reply_video). Result: "Save to Gallery" / 3-dot download renames the file
+    to video_<date>.mp4 and on mobile long-press there is no reliable Download
+    option. Documents ALWAYS carry their filename — web download, Android and
+    iOS all save exactly as username_…_date.ext, and long-press always offers
+    Save/Download.
 
-    Falls back to reply_document automatically if the native send fails
-    (e.g. file too large for inline video, codec unsupported, etc.)
+    reply_video is kept ONLY as an automatic fallback if the document send fails.
     """
     buf = io.BytesIO(data)
     buf.name = filename   # Telegram reads .name for the filename
 
     if ext in _VIDEO_EXTS:
-        # Try native video first — this is what preserves gallery filename
+        # Primary: document with content-type detection DISABLED.
+        # Without this flag Telegram auto-embeds mp4 docs as playable media and
+        # mobile "Save to Gallery" renames them. As a strict file card the
+        # 3-dot / Save flow ALWAYS stores the exact username_date filename.
         result = await safe_send(
-            message.reply_video,
-            video=buf,
+            message.reply_document,
+            document=buf,
             filename=filename,
-            caption=caption,
-            supports_streaming=True,
+            caption=f"{caption}\n📎 {filename}",
+            disable_content_type_detection=True,
             write_timeout=120,
             read_timeout=120,
         )
         if result:
             return True
-        # Fallback: send as document (filename still correct, just no inline play)
+        # Fallback 1: normal embedded document (playable, name usually kept)
         buf.seek(0)
         result = await safe_send(
             message.reply_document,
             document=buf,
             filename=filename,
-            caption=caption + "\n_(sent as file — tap to download)_",
+            caption=f"{caption}\n📎 {filename}",
+            write_timeout=120,
+            read_timeout=120,
+        )
+        if result:
+            return True
+        # Fallback 2: native video message (inline playback, but no filename)
+        buf.seek(0)
+        result = await safe_send(
+            message.reply_video,
+            video=buf,
+            filename=filename,
+            caption=caption + "\n_(sent as video — filename not guaranteed)_",
+            supports_streaming=True,
+            write_timeout=120,
+            read_timeout=120,
         )
         return result is not None
 
@@ -906,11 +1064,20 @@ async def zip_and_send(query, items: List[SnapContent],
         zlabel = f"part{z+1}of{num_zips}" if num_zips > 1 else "all"
 
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            used_names = set()
             for item in chunk:
                 result_tuple = await asyncio.to_thread(dl.download_file, item)
                 if result_tuple:
                     data, ext = result_tuple
-                    zf.writestr(make_filename(item, ext), data)
+                    fname = make_filename(item, ext)
+                    # keep username_date format unique inside the archive
+                    stem, dot, suffix = fname.rpartition(".")
+                    n = 2
+                    while fname in used_names:
+                        fname = f"{stem}_{n}.{suffix}"
+                        n += 1
+                    used_names.add(fname)
+                    zf.writestr(fname, data)
                     added += 1
                 else:
                     failed += 1
@@ -1535,7 +1702,26 @@ def main():
     print("║  ✅  Notification → inline button → direct download      ║")
     print("╚" + "═" * 60 + "╝")
 
-    app = Application.builder().token(TOKEN).build()
+    _apply_ptb_updater_slots_compat()
+    builder = (
+        Application.builder()
+        .token(TOKEN)
+        .job_queue(None)
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .read_timeout(TELEGRAM_READ_TIMEOUT)
+        .write_timeout(TELEGRAM_WRITE_TIMEOUT)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+        .get_updates_connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .get_updates_read_timeout(TELEGRAM_READ_TIMEOUT)
+        .get_updates_write_timeout(TELEGRAM_WRITE_TIMEOUT)
+        .get_updates_pool_timeout(TELEGRAM_POOL_TIMEOUT)
+    )
+    if TELEGRAM_PROXY_URL:
+        builder = builder.proxy(TELEGRAM_PROXY_URL).get_updates_proxy(TELEGRAM_PROXY_URL)
+        logger.info("Telegram proxy enabled via TELEGRAM_PROXY_URL")
+    else:
+        logger.info("No TELEGRAM_PROXY_URL set; using direct Telegram connection")
+    app = builder.build()
 
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     help_command))
@@ -1557,6 +1743,10 @@ def main():
         app.job_queue.run_repeating(check_new_stories, interval=TRACK_INTERVAL, first=20)
     else:
         logger.warning("Install python-telegram-bot[job-queue] for tracking support.")
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     print("\n🟢  Bot is running — press Ctrl+C to stop\n")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
