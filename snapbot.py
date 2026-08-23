@@ -87,6 +87,7 @@ MAX_ZIP_PER_FILE = 45       # files per ZIP before splitting
 SEND_DELAY       = 0.7      # seconds between Telegram sends
 DOWNLOAD_RETRY   = 3
 TRACK_INTERVAL   = 300      # seconds between notification checks
+FIRST_TRACK_CHECK = 20      # seconds after startup for first check
 MAX_HISTORY      = 10       # searches remembered per user
 
 DATA_FILE = Path("bot_data.pkl")
@@ -121,11 +122,19 @@ class BotStats:
 # ─────────────────────────────────────────────────────────────
 # PERSISTENT STORAGE
 # ─────────────────────────────────────────────────────────────
+class _RemapMainUnpickler(pickle.Unpickler):
+    """Unpickles classes saved as '__main__.X' when the module was imported
+    under a different name (Docker, wrappers, tests)."""
+    def find_class(self, module, name):
+        if module == "__main__":
+            module = __name__
+        return super().find_class(module, name)
+
 def _load_data() -> Dict:
     if DATA_FILE.exists():
         try:
             with open(DATA_FILE, "rb") as f:
-                return pickle.load(f)
+                return _RemapMainUnpickler(f).load()
         except Exception as e:
             logger.warning(f"Could not load data: {e}")
     return {"tracks": {}, "stats": BotStats(), "history": {}}
@@ -503,13 +512,13 @@ class SnapchatDownloader:
         seen = set()
         try:
             pp    = data.get("props", {}).get("pageProps", {})
-            story = pp.get("story", {})
-            snaps = story.get("snapList") or story.get("snaps", [])
+            story = pp.get("story") or {}
+            snaps = story.get("snapList") or story.get("snaps") or []
 
             # Also check userProfile.publicStories for some account types
-            user_profile = pp.get("userProfile", {})
-            pub = user_profile.get("publicStories", {})
-            extra_snaps = pub.get("snapList", [])
+            user_profile = pp.get("userProfile") or {}
+            pub = user_profile.get("publicStories") or {}
+            extra_snaps = pub.get("snapList") or []
 
             for s in list(snaps) + list(extra_snaps):
                 c = self._extract_snap(s, username, False)
@@ -543,7 +552,7 @@ class SnapchatDownloader:
                     sections.append(item)
 
             # Some profiles store spotlights directly under userProfile
-            user_profile = pp.get("userProfile", {})
+            user_profile = pp.get("userProfile") or {}
             for key in ("spotlightHighlights", "highlights"):
                 extra = user_profile.get(key)
                 if isinstance(extra, list):
@@ -1128,6 +1137,10 @@ Just send a username — full menu with pagination, filters
 `/track user`   — notify on new stories
 `/untrack user` — stop tracking
 `/mytracks`     — list tracked users
+`/export`       — export tracked users as JSON file
+`/import`       — import: attach the JSON/txt file,
+                  or `/import user1 user2 …`
+`/testnotify`   — send a test notification now
 ━━━━━━━━━━━━━━━━━━━━━━━
 📊 *INFO*
 `/stats`    — download statistics
@@ -1363,6 +1376,180 @@ async def mytracks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n".join(lines), parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kbd),
+    )
+
+# ── Export / Import tracked users ──────────────────────────
+MAX_IMPORT = 100
+
+def _parse_usernames_text(text: str) -> List[str]:
+    """Extract clean usernames from free-form text (newlines, spaces, commas)."""
+    out, seen = [], set()
+    for tok in re.split(r"[\s,;]+", text or ""):
+        u = tok.strip().lstrip("@").lower()
+        if len(u) >= 3 and re.fullmatch(r"[a-z0-9._-]+", u) and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+async def _process_track_import(chat_id: int, usernames: List[str], progress_cb=None):
+    """
+    Add usernames to tracking with a proper story baseline.
+    Returns (added, no_content, skipped):
+      added      — [(username, newest_story_ts)] successfully tracked
+      no_content — [username] profile has no public content (not added)
+      skipped    — [username] already tracked or fetch error
+    """
+    dl = SnapchatDownloader()
+    added, no_content, skipped = [], [], []
+    total = len(usernames)
+    for i, u in enumerate(usernames, 1):
+        key = f"{chat_id}:{u}"
+        if key in user_tracks:
+            skipped.append(u)
+        else:
+            try:
+                s, sp = await asyncio.to_thread(dl.get_all, u)
+                if s or sp:
+                    user_tracks[key] = UserTrack(
+                        chat_id=chat_id, username=u,
+                        last_check=time.time(),
+                        last_story_time=s[0].timestamp if s else int(time.time()),
+                    )
+                    added.append((u, s[0].timestamp if s else 0))
+                else:
+                    no_content.append(u)
+            except Exception as e:
+                logger.warning(f"Import @{u} failed: {e}")
+                skipped.append(u)
+        if progress_cb and (i % 5 == 0 or i == total):
+            try:
+                await progress_cb(
+                    f"📥 Importing… {i}/{total}\n"
+                    f"✅ {len(added)} added  •  🚫 {len(no_content)} none  •  "
+                    f"⏭️ {len(skipped)} skipped")
+            except Exception:
+                pass
+        await asyncio.sleep(0.3)
+    _save_data()
+    return added, no_content, skipped
+
+async def export_tracks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mine = [t for t in user_tracks.values() if t.chat_id == chat_id]
+    if not mine:
+        await update.message.reply_text("📭 No tracked users to export.\nUse /track username")
+        return
+    payload = {
+        "type": "snapbot_tracks",
+        "version": 1,
+        "exported": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "count": len(mine),
+        "tracks": [{"username": t.username} for t in mine],
+    }
+    buf = io.BytesIO(json.dumps(payload, indent=2).encode("utf-8"))
+    fname = f"snapbot_tracks_{datetime.now():%Y%m%d_%H%M%S}.json"
+    buf.name = fname
+    await update.message.reply_document(
+        document=buf,
+        filename=fname,
+        caption=(f"📤 *Exported {len(mine)} tracked user(s)*\n"
+                 f"Attach this file to `/import` to restore."),
+        parse_mode="Markdown",
+    )
+
+async def import_tracks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    usernames: List[str] = []
+
+    doc = update.message.document
+    if doc is not None:
+        if (doc.file_size or 0) > 200_000:
+            await update.message.reply_text("❌ File too large (max 200 KB).")
+            return
+        tg_file = await doc.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+        text = raw.decode("utf-8", "ignore")
+        parsed = None
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                lst = data.get("tracks") or data.get("users") or []
+            elif isinstance(data, list):
+                lst = data
+            else:
+                lst = []
+            names = [x.get("username") if isinstance(x, dict) else str(x) for x in lst]
+            parsed = "\n".join(names)
+        except json.JSONDecodeError:
+            parsed = text   # plain-text list, one username per line
+        usernames = _parse_usernames_text(parsed or "")
+    else:
+        usernames = _parse_usernames_text(" ".join(context.args or []))
+
+    if not usernames:
+        await update.message.reply_text(
+            "❌ No usernames found.\n\n"
+            "• Attach a `.json`/`.txt` file to `/import`, or\n"
+            "• `/import user1 user2 user3`"
+        )
+        return
+
+    if len(usernames) > MAX_IMPORT:
+        await update.message.reply_text(
+            f"⚠️ {len(usernames)} found — importing first {MAX_IMPORT}.")
+        usernames = usernames[:MAX_IMPORT]
+
+    prog = await update.message.reply_text(
+        f"📥 Importing {len(usernames)} user(s)…")
+    added, no_content, skipped = await _process_track_import(
+        chat_id, usernames,
+        progress_cb=lambda txt: prog.edit_text(txt),
+    )
+
+    lines = ["✅ *Import complete!*", ""]
+    if added:
+        lines.append(f"➕ Added & verified: `{len(added)}`")
+        for u, ts in added:
+            age = f"  _(last story {human_age(ts)})_" if ts else ""
+            lines.append(f"   • @{u}{age}")
+    if no_content:
+        lines.append(f"\n🚫 No public content (not added): `{len(no_content)}`")
+        lines.append("`" + " ".join("@" + u for u in no_content[:20]) + "`")
+    if skipped:
+        lines.append(f"\n⏭️ Skipped (already tracked / failed): `{len(skipped)}`")
+        lines.append("`" + " ".join("@" + u for u in skipped[:20]) + "`")
+    await prog.edit_text("\n".join(lines), parse_mode="Markdown")
+
+async def testnotify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    app     = context.application
+    mine    = [t for t in user_tracks.values() if t.chat_id == chat_id]
+
+    # Send a real notification-style message so they see exactly what it looks like
+    uname = mine[0].username if mine else None
+    kbd = (InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📥 Open @{uname}", callback_data=cb("reopen", uname))
+    ]]) if uname else None)
+    await update.message.reply_text(
+        f"🔔 *TEST NOTIFICATION*\n"
+        f"@{uname or 'example_user'} posted 1 new story!\n\n"
+        f"Real notifications look exactly like this 👆",
+        parse_mode="Markdown",
+        reply_markup=kbd,
+    )
+
+    jq = app.job_queue
+    mode = ("✅ JobQueue" if jq is not None else "⚠️ fallback loop") + \
+           f" every {TRACK_INTERVAL}s"
+    await update.message.reply_text(
+        "🧪 *Diagnostics*\n"
+        f"• Scheduler: `{mode}`\n"
+        f"• Bot process: `{app.running}`\n"
+        f"• Your tracked users: `{len(mine)}`\n\n"
+        "If you received the TEST message above, delivery works.\n"
+        "You'll get a real one when a tracked user posts a NEW story "
+        "(checked every 5 min).",
+        parse_mode="Markdown",
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -1649,6 +1836,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────
 async def check_new_stories(context: ContextTypes.DEFAULT_TYPE):
     if not user_tracks:
+        logger.info("Track check: no users tracked")
         return
     dl      = SnapchatDownloader()
     changed = False
@@ -1658,6 +1846,13 @@ async def check_new_stories(context: ContextTypes.DEFAULT_TYPE):
             stories, _ = await asyncio.to_thread(dl.get_all, track.username)
             track.last_check = time.time()
             changed = True
+
+            if track.last_story_time == 0:
+                # First check after tracking started — record a baseline
+                # so existing stories don't trigger a false notification.
+                if stories:
+                    track.last_story_time = stories[0].timestamp
+                continue
 
             if stories and stories[0].timestamp > track.last_story_time:
                 new_count = sum(1 for s in stories if s.timestamp > track.last_story_time)
@@ -1678,11 +1873,51 @@ async def check_new_stories(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=kbd,
                 )
+                logger.info(f"NOTIFICATION sent: @{track.username} "
+                            f"{new_count} new → chat {track.chat_id}")
         except Exception as e:
             logger.error(f"Track check error ({track.username}): {e}")
 
     if changed:
         _save_data()
+
+
+async def _run_tracking_check(app) -> None:
+    from types import SimpleNamespace
+    await check_new_stories(SimpleNamespace(bot=app.bot))
+
+
+async def _fallback_tracking_loop(app) -> None:
+    """Works even without APScheduler — pure asyncio loop."""
+    await asyncio.sleep(FIRST_TRACK_CHECK)
+    while True:
+        try:
+            await _run_tracking_check(app)
+        except Exception as e:
+            logger.error(f"Fallback tracking loop error: {e}")
+        await asyncio.sleep(TRACK_INTERVAL)
+
+
+_track_task = None
+
+async def _post_init(app):
+    global _track_task
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            check_new_stories, interval=TRACK_INTERVAL, first=FIRST_TRACK_CHECK)
+        logger.info(f"🔔 Tracking ACTIVE via JobQueue (every {TRACK_INTERVAL}s)")
+    else:
+        _track_task = app.create_task(_fallback_tracking_loop(app))
+        logger.warning(
+            f"🔔 Tracking ACTIVE via fallback loop (every {TRACK_INTERVAL}s) — "
+            f"install 'APScheduler' for the native scheduler")
+    logger.info(f"🔔 First notification check in {FIRST_TRACK_CHECK}s • "
+                f"{len(user_tracks)} user(s) tracked")
+
+
+async def _post_stop(app):
+    if _track_task is not None:
+        _track_task.cancel()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1706,7 +1941,6 @@ def main():
     builder = (
         Application.builder()
         .token(TOKEN)
-        .job_queue(None)
         .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
         .read_timeout(TELEGRAM_READ_TIMEOUT)
         .write_timeout(TELEGRAM_WRITE_TIMEOUT)
@@ -1716,6 +1950,7 @@ def main():
         .get_updates_write_timeout(TELEGRAM_WRITE_TIMEOUT)
         .get_updates_pool_timeout(TELEGRAM_POOL_TIMEOUT)
     )
+    builder = builder.post_init(_post_init).post_stop(_post_stop)
     if TELEGRAM_PROXY_URL:
         builder = builder.proxy(TELEGRAM_PROXY_URL).get_updates_proxy(TELEGRAM_PROXY_URL)
         logger.info("Telegram proxy enabled via TELEGRAM_PROXY_URL")
@@ -1733,16 +1968,15 @@ def main():
     app.add_handler(CommandHandler("track",    track_command))
     app.add_handler(CommandHandler("untrack",  untrack_command))
     app.add_handler(CommandHandler("mytracks", mytracks_command))
+    app.add_handler(CommandHandler("export",   export_tracks_command))
+    app.add_handler(CommandHandler("import",   import_tracks_command))
+    app.add_handler(CommandHandler("testnotify", testnotify_command))
     app.add_handler(CommandHandler("stats",    stats_command))
     app.add_handler(CommandHandler("history",  history_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username))
 
-    if app.job_queue:
-        app.job_queue.run_repeating(check_new_stories, interval=TRACK_INTERVAL, first=20)
-    else:
-        logger.warning("Install python-telegram-bot[job-queue] for tracking support.")
     try:
         asyncio.get_event_loop()
     except RuntimeError:
